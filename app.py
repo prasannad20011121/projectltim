@@ -88,18 +88,42 @@ def download_from_drive(url, dest_path):
         raise
 
 # ======================
-# ✅ Load All Models (cached)
+# ✅ Load All Models (Safe & Cached)
 # ======================
 @st.cache_resource
 def load_models():
-    st.info("Loading AI models from Google Drive (first time only)...")
+    st.info("🔄 Loading AI models from Google Drive (first time only)...")
     loaded = {}
+
     for key, path in MODEL_PATHS.items():
-        if not os.path.exists(path):
-            st.warning(f"Model '{key}' not found locally. Downloading...")
-            download_from_drive(MODEL_URLS[key], path)
-        loaded[key] = tf.keras.models.load_model(path)
-    st.success("✅ All models loaded and cached successfully!")
+        try:
+            # Download if missing or corrupted
+            if not os.path.exists(path) or os.path.getsize(path) < 100000:
+                st.warning(f"Model '{key}' not found or incomplete. Downloading...")
+                download_from_drive(MODEL_URLS[key], path)
+
+            st.write(f"📦 Loading {key} model...")
+            loaded[key] = tf.keras.models.load_model(path)
+            st.success(f"✅ Loaded: {key}")
+
+        except Exception as e:
+            st.error(f"❌ Failed to load {key} model: {e}")
+
+            # Retry download once
+            try:
+                st.warning(f"Retrying download for {key}...")
+                download_from_drive(MODEL_URLS[key], path)
+                loaded[key] = tf.keras.models.load_model(path)
+                st.success(f"✅ Loaded after retry: {key}")
+            except Exception as e2:
+                st.error(f"🚫 Could not load {key} model after retry. Please check model file integrity.")
+                loaded[key] = None
+
+    if not loaded.get("main"):
+        st.stop()
+        raise RuntimeError("Critical error: Main model failed to load. Cannot continue.")
+
+    st.success("🎉 All available models loaded successfully!")
     return loaded
 
 models = load_models()
@@ -142,10 +166,13 @@ def local_report(organ, finding, mode):
 **DATE OF SERVICE:** {today}
 **EXAMINATION:**
 AI-assisted {organ.capitalize()} imaging analysis.
+
 **FINDINGS:**
 The scan suggests a "{finding}" finding in the {organ}.
+
 **IMPRESSION:**
 AI indicates possible {finding}. Recommend clinical correlation.
+
 **RECOMMENDATIONS:**
 1. Specialist consultation
 2. Confirmatory imaging
@@ -157,13 +184,17 @@ AI indicates possible {finding}. Recommend clinical correlation.
 **Date:** {today}
 **Scan Type:** {organ.capitalize()} Scan
 **AI Finding:** {finding.capitalize()}
+
 **WHAT THIS MEANS:**
 Our AI system detected signs of "{finding.lower()}" in your {organ}.
+
 **NEXT STEPS:**
 Consult your doctor for detailed evaluation and next investigations.
+
 **DO'S:**
 - Schedule a follow-up with your doctor
 - Stay calm and follow medical advice
+
 **DON'TS:**
 - Don’t self-diagnose or panic
 - Don’t alter medication without medical guidance

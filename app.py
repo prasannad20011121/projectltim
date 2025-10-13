@@ -1,6 +1,7 @@
 import os
 import io
-import time
+import uuid
+import datetime
 import requests
 import numpy as np
 from PIL import Image
@@ -11,152 +12,205 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 
-# ===================================================
-# Google Drive Links for All Models
-# ===================================================
+# ======================
+# Google Drive Model Links (Replace with your file IDs)
+# ======================
 MODEL_LINKS = {
     "main": "https://drive.google.com/uc?id=1MrmfGNWW6Msz71WTcrCJcouk5vyDWhMq",
     "brain": "https://drive.google.com/uc?id=1MFRWHTsp830qpVFm19x-74gQ3h6XsJ73",
-    "bone": "https://drive.google.com/uc?id=1cFVYwUz8rVY1RBFs4tCJzvZWqZb14WyM",
-    "breast": "https://drive.google.com/uc?id=YOUR_BREAST_MODEL_ID",
-    "kidney": "https://drive.google.com/uc?id=YOUR_KIDNEY_MODEL_ID"
+    "bone": "https://drive.google.com/uc?id=1cFVYwUz8rV",
+    "breast": "https://drive.google.com/uc?id=1abcd123456789fakeID",  # Replace with real
+    "kidney": "https://drive.google.com/uc?id=1abcd987654321fakeID"   # Replace with real
 }
 
-# ===================================================
-# Utility: Safe Downloader
-# ===================================================
-def safe_download(url, path, retries=3):
-    """Download model from Google Drive and verify file exists."""
-    for attempt in range(1, retries + 1):
-        try:
-            if os.path.exists(path):
-                return path
-            st.info(f"📥 Downloading {os.path.basename(path)} (attempt {attempt})...")
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
-            total = int(response.headers.get('content-length', 0))
-            with open(path, 'wb') as f:
-                downloaded = 0
-                for chunk in response.iter_content(1024 * 1024):
+# ======================
+# Streamlit Config
+# ======================
+st.set_page_config(page_title="AI Medical Report Generator", layout="wide")
+st.title("🧠 AI Medical Report Generator")
+st.caption("Upload a scan → AI Diagnosis → LLM Report → Download PDF")
+
+MODEL_DIR = "models"
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+MAIN_CLASSES = ['bone', 'brain', 'breast', 'kidney']
+BRAIN_CLASSES = ['glioma', 'meningioma', 'notumor', 'pituitary']
+BONE_CLASSES = ['fractured', 'not fractured']
+BREAST_CLASSES = ['benign', 'malignant']
+KIDNEY_CLASSES = ['cyst', 'normal', 'stone', 'tumor']
+
+# ======================
+# Google Drive Downloader
+# ======================
+def download_model_if_missing(name):
+    """Download model file if not found locally"""
+    local_path = os.path.join(MODEL_DIR, f"{name}_model.keras")
+    if not os.path.exists(local_path):
+        st.info(f"📥 Downloading {name} model from Drive... (may take a few minutes)")
+        url = MODEL_LINKS.get(name)
+        if not url:
+            st.error(f"No Drive link configured for model '{name}'")
+            return None
+        response = requests.get(url, stream=True)
+        with open(local_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
                     f.write(chunk)
-                    downloaded += len(chunk)
-                    percent = (downloaded / total) * 100 if total else 0
-                    st.write(f"Downloading... {percent:.1f}%")
-            if os.path.exists(path) and os.path.getsize(path) > 0:
-                st.success(f"✅ Downloaded {os.path.basename(path)} successfully!")
-                return path
-        except Exception as e:
-            st.warning(f"⚠️ Attempt {attempt} failed: {e}")
-            time.sleep(3)
-    st.error(f"❌ Could not download {os.path.basename(path)} after {retries} attempts.")
-    return None
+        st.success(f"✅ Downloaded {name} model!")
+    return local_path
 
-# ===================================================
-# Load Models (Cached)
-# ===================================================
+# ======================
+# Load All Models (with Cache)
+# ======================
 @st.cache_resource
-def load_models():
+def load_all_models():
     models = {}
-    os.makedirs("models", exist_ok=True)
-
-    for key, url in MODEL_LINKS.items():
-        model_path = f"models/{key}_model.keras"
-        downloaded = safe_download(url, model_path)
-        if downloaded:
-            try:
-                models[key] = tf.keras.models.load_model(model_path)
-                st.success(f"✅ Loaded {key} model successfully.")
-            except Exception as e:
-                st.error(f"❌ Failed to load {key} model after retry: {e}")
-                models[key] = None
-        else:
+    for key in MODEL_LINKS.keys():
+        path = download_model_if_missing(key)
+        try:
+            models[key] = tf.keras.models.load_model(path)
+            st.success(f"✅ {key.capitalize()} model loaded")
+        except Exception as e:
+            st.error(f"❌ Could not load {key} model: {e}")
             models[key] = None
     return models
 
-# ===================================================
-# PDF Report Generator
-# ===================================================
-def generate_pdf(patient_name, age, diagnosis, result, image, do_list, dont_list):
+models = load_all_models()
+
+# ======================
+# Gemini LLM Integration
+# ======================
+USE_GEMINI = True
+try:
+    import google.generativeai as genai
+except ImportError:
+    USE_GEMINI = False
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if USE_GEMINI and GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    llm_model = genai.GenerativeModel("gemini-2.5-pro")
+else:
+    llm_model = None
+    st.warning("⚠️ Gemini API not found. Fallback text reports will be used.")
+
+# ======================
+# Image Preprocessing
+# ======================
+def preprocess_image(img, model):
+    """Preprocess image dynamically based on model input shape."""
+    img = img.resize((224, 224))
+    expected_channels = model.input_shape[-1]
+
+    if expected_channels == 1:
+        img = img.convert("L")
+        arr = np.expand_dims(np.array(img) / 255.0, axis=(0, -1))
+    else:
+        img = img.convert("RGB")
+        arr = np.expand_dims(np.array(img) / 255.0, axis=0)
+    return arr
+
+# ======================
+# Prediction Functions
+# ======================
+def predict_main(img_tensor):
+    preds = models["main"].predict(img_tensor)
+    idx = int(np.argmax(preds))
+    return MAIN_CLASSES[idx], float(preds[0][idx])
+
+def predict_domain(organ, img_tensor):
+    classes = {
+        "brain": BRAIN_CLASSES,
+        "bone": BONE_CLASSES,
+        "breast": BREAST_CLASSES,
+        "kidney": KIDNEY_CLASSES
+    }[organ]
+    model = models[organ]
+    preds = model.predict(img_tensor)
+    idx = int(np.argmax(preds))
+    return classes[idx], float(preds[0][idx])
+
+# ======================
+# Local Report Generator
+# ======================
+def local_report(organ, finding, mode):
+    if mode == "Doctor Mode":
+        return f"**FINDINGS:** The AI detected {finding} in {organ}. Further imaging recommended."
+    else:
+        return f"The AI found signs of {finding} in your {organ}. Please consult your doctor."
+
+# ======================
+# PDF Generator
+# ======================
+def generate_pdf(report_text, image, organ, organ_conf, finding_conf):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
+    c.setFont("Helvetica-Bold", 18)
+    c.drawCentredString(width/2, height-40, "AI MEDICAL REPORT")
+    c.setFont("Helvetica", 11)
+    c.drawString(50, height-70, f"Organ: {organ.capitalize()}")
+    c.drawString(50, height-90, f"Organ Confidence: {organ_conf*100:.2f}%")
+    c.drawString(50, height-110, f"Finding Confidence: {finding_conf*100:.2f}%")
 
-    c.setFont("Helvetica-Bold", 20)
-    c.drawCentredString(width / 2, height - 50, "AI Medical Diagnostic Report")
-    c.setFont("Helvetica", 12)
-    c.drawString(40, height - 100, f"Patient Name: {patient_name}")
-    c.drawString(40, height - 120, f"Age: {age}")
-    c.drawString(40, height - 140, f"Scan Type: {diagnosis}")
+    image = image.convert("RGB")
+    img_buf = io.BytesIO()
+    image.save(img_buf, format="PNG")
+    img_buf.seek(0)
+    c.drawImage(ImageReader(img_buf), 50, height-400, width=200, preserveAspectRatio=True)
 
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(40, height - 180, "Diagnosis Result:")
-    c.setFont("Helvetica", 12)
-    text = c.beginText(40, height - 200)
-    text.textLines(result)
-    c.drawText(text)
-
-    if image:
-        image = image.resize((250, 250))
-        c.drawImage(ImageReader(image), width - 320, height - 420, width=250, height=250)
-
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(40, height - 460, "Do's:")
-    c.setFont("Helvetica", 12)
-    text = c.beginText(60, height - 480)
-    text.textLines(do_list)
-    c.drawText(text)
-
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(40, height - 540, "Don'ts:")
-    c.setFont("Helvetica", 12)
-    text = c.beginText(60, height - 560)
-    text.textLines(dont_list)
-    c.drawText(text)
-
-    c.showPage()
+    text_obj = c.beginText(50, height-420)
+    text_obj.textLines(report_text)
+    c.drawText(text_obj)
     c.save()
     buffer.seek(0)
     return buffer
 
-# ===================================================
+# ======================
 # Streamlit UI
-# ===================================================
-st.set_page_config(page_title="AI Medical Report Generator", layout="wide")
-st.title("🧠 AI Medical Report Generator")
+# ======================
+col1, col2 = st.columns([1, 1.2])
 
-models = load_models()
+with col1:
+    st.subheader("📤 Upload Image")
+    uploaded = st.file_uploader("Upload JPG / PNG", type=["jpg", "jpeg", "png"])
+    mode = st.radio("Report Type", ["Doctor Mode", "Patient Mode"], horizontal=True)
 
-with st.form("patient_form"):
-    patient_name = st.text_input("👤 Patient Name")
-    age = st.number_input("🎂 Age", 0, 120, 25)
-    diagnosis = st.selectbox("🧪 Select Diagnosis Type", ["Brain", "Bone", "Main", "Breast", "Kidney"])
-    uploaded_img = st.file_uploader("📸 Upload MRI / X-Ray Image", type=["jpg", "jpeg", "png"])
-    submitted = st.form_submit_button("Generate Report")
+with col2:
+    if uploaded:
+        img = Image.open(uploaded)
+        st.image(img, caption="Uploaded Scan", use_column_width=True)
 
-if submitted:
-    if not uploaded_img:
-        st.error("Please upload a scan image first.")
+        if st.button("🧠 Generate Report"):
+            with st.spinner("Analyzing..."):
+                main_input = preprocess_image(img, models["main"])
+                organ, conf_org = predict_main(main_input)
+
+                domain_input = preprocess_image(img, models[organ])
+                finding, conf_find = predict_domain(organ, domain_input)
+
+                st.success(f"✅ Organ: {organ.upper()} ({conf_org*100:.1f}%) | Finding: {finding.upper()} ({conf_find*100:.1f}%)")
+
+            with st.spinner("🩺 Generating Report..."):
+                report_text = ""
+                if llm_model:
+                    try:
+                        prompt = f"Generate a detailed {mode} report for organ '{organ}' with finding '{finding}'."
+                        response = llm_model.generate_content(prompt)
+                        report_text = response.text.strip()
+                    except Exception:
+                        report_text = local_report(organ, finding, mode)
+                else:
+                    report_text = local_report(organ, finding, mode)
+
+            st.subheader("🧾 Generated Report")
+            st.text_area("Report Text", value=report_text, height=400)
+
+            pdf = generate_pdf(report_text, img, organ, conf_org, conf_find)
+            st.download_button("⬇️ Download PDF", data=pdf, file_name=f"{organ}_report.pdf", mime="application/pdf")
+
     else:
-        model_key = diagnosis.lower()
-        model = models.get(model_key)
+        st.info("Please upload an image to start diagnosis.")
 
-        if model is None:
-            st.error(f"Model for {diagnosis} is not loaded properly.")
-        else:
-            img = Image.open(uploaded_img).convert("RGB").resize((224, 224))
-            img_arr = np.expand_dims(np.array(img) / 255.0, axis=0)
-            preds = model.predict(img_arr)
-            pred_class = np.argmax(preds, axis=1)[0]
-
-            result_text = f"Model Prediction: Class {pred_class}\n"
-            result_text += "⚕️ Consult your doctor for medical confirmation.\n"
-
-            do_list = "- Follow up with your doctor.\n- Maintain a healthy diet.\n- Take prescribed medication regularly."
-            dont_list = "- Do not ignore symptoms.\n- Avoid self-medication.\n- Don’t delay further scans if advised."
-
-            st.subheader("📋 Report Summary")
-            st.write(result_text)
-
-            pdf = generate_pdf(patient_name, age, diagnosis, result_text, img, do_list, dont_list)
-            st.download_button("⬇️ Download Report as PDF", pdf, file_name=f"{patient_name}_report.pdf")
-
+st.markdown("---")
+st.caption("⚠️ For educational use only. Consult a medical professional for diagnosis.")
